@@ -12,7 +12,7 @@ Two data modes are supported, chosen automatically from the dataset name:
 
 Example
 -------
-    python3 da_awlssvm_search.py --dataset 3Sources  --coupling hard --method dissim --maxiter 1 --results_folder results
+    python3 da_awlssvm.py --dataset 3Sources  --coupling hard --method dissim --maxiter 1 --results_folder results
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-from mv_lssvm import AW_LSSVM, PrecomputedAW_LSSVM
+from kernel_MVL import AW_LSSVM, PrecomputedAW_LSSVM
 
 warnings.filterwarnings("ignore")
 
