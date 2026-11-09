@@ -71,14 +71,12 @@ The results are saved to `<results_folder>/DA_<dataset>_<coupling>_<method>_<max
 If you use this code, please cite:
 
 ```bibtex
-@inproceedings{faramarzi2026awlssvm,
-  title     = {Adaptive Weighted LS-SVM for Multi-view Classification},
-  author    = {Faramarzi Lighvan, Farnaz and Asadi, Mehrdad and Houthuys, Lynn},
-  booktitle = {Artificial Neural Networks and Machine Learning -- ICANN 2026},
-  series    = {Lecture Notes in Computer Science},
-  volume    = {17089},
-  publisher = {Springer, Cham},
-  year      = {2027},
-  doi       = {10.1007/978-3-032-38398-3_34}
+@inproceedings{faramarzi2026adaptive,
+  title={Adaptive Weighted LS-SVM for Multi-view Classification},
+  author={Faramarzi Lighvan, Farnaz and Asadi, Mehrdad and Houthuys, Lynn},
+  booktitle={International Conference on Artificial Neural Networks},
+  pages={408--419},
+  year={2026},
+  organization={Springer}
 }
 ```
