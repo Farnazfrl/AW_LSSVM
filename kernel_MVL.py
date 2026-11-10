@@ -24,7 +24,6 @@ This module implements:
 from __future__ import annotations
 
 import numpy as np
-from scipy.linalg import block_diag, solve
 from scipy.stats import mode
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 from sklearn.model_selection import StratifiedKFold
@@ -217,7 +216,21 @@ class PrecomputedMultiClassLSSVM:
 # --------------------------------------------------------------------------- #
 
 class MultiViewLSSVM:
-    """Multi-view LS-SVM with pairwise error coupling across views (raw features)."""
+    """Multi-view LS-SVM with pairwise error coupling across views (raw
+    features), one-vs-all for multiclass problems.
+
+    Substituting a_v = alpha_v * y and multiplying every row block of the
+    coupled dual system by y removes the labels from its matrix:
+
+        rows of view v1:  g_v1 b_v1 + ro sum_{v2 != v1} b_v2
+                          + (g_v1 K_v1 + I) a_v1 + ro sum_{v2 != v1} K_v2 a_v2
+                          = (g_v1 + (V - 1) ro) y
+        top rows:         1^T a_v = 0
+
+    with g_v = gamma[v] + ro_adaptive * weights. All one-vs-all subproblems are
+    therefore solved with one factorization (one right-hand side per class).
+    The decision value of a class is the mean of the view-specific scores.
+    """
 
     def __init__(self, gamma, gamma_rbf: float = 1.0, ro: float = 10, ro_adaptive: float = 1):
         self.gamma = gamma          # per-view error regularization
@@ -233,134 +246,66 @@ class MultiViewLSSVM:
             setattr(self, key, value)
         return self
 
-    def fit(self, X, y, weights=0) -> None:
+    def _train_kernels(self, X):
+        return [rbf_kernel_matrix(Xv, Xv, self.gamma_rbf) for Xv in X]
+
+    def _test_kernels(self, X_test):
+        return [rbf_kernel_matrix(Xt, Xv, self.gamma_rbf) for Xt, Xv in zip(X_test, self.X_train)]
+
+    def fit(self, X, y, weights=0) -> "MultiViewLSSVM":
         self.X_train = X
+        self.K = self._train_kernels(X)
+        self._solve(y, weights)
+        return self
+
+    def _solve(self, y, weights) -> None:
         self.classes = np.unique(y)
         self.n_classes = int(len(self.classes))
-        self.n_samples = int(X[0].shape[0])
-        self.n_views = len(self.X_train)
+        self.n_views = len(self.K)
+        self.n_samples = n = int(self.K[0].shape[0])
+        V, ro = self.n_views, float(self.ro)
+        g = np.asarray(self.gamma, dtype=float)[:V] + self.ro_adaptive * weights
 
-        self.K = [rbf_kernel_matrix(X[v], X[v], self.gamma_rbf) for v in range(self.n_views)]
+        Y = np.where(y[:, None] == self.classes[None, :], 1.0, -1.0)   # (n, C)
+        self.Y = Y
+        size = V + V * n
+        P = np.zeros((size, size))
+        rhs = np.zeros((size, self.n_classes))
+        for v1 in range(V):
+            r1 = slice(V + v1 * n, V + (v1 + 1) * n)
+            P[v1, r1] = 1.0
+            rhs[r1] = (g[v1] + (V - 1) * ro) * Y
+            for v2 in range(V):
+                r2 = slice(V + v2 * n, V + (v2 + 1) * n)
+                if v1 == v2:
+                    P[r1, v2] = g[v1]
+                    P[r1, r2] = g[v1] * self.K[v1] + np.eye(n)
+                else:
+                    P[r1, v2] = ro
+                    P[r1, r2] = ro * self.K[v2]
+        P[np.diag_indices(size)] += 1e-4          # numerical jitter
+        sol = np.linalg.solve(P, rhs)             # one factorization, C right-hand sides
 
-        if self.n_classes > 2:
-            Y = np.zeros((self.n_samples, self.n_classes))
-            for i, cls in enumerate(self.classes):
-                Y[:, i] = np.where(y == cls, 1, -1)
-            self.Y = Y
-        else:
-            Y = y
-            self.Y = y
+        self.biases_multiclass = sol[:V]                                   # (V, C)
+        a = sol[V:].reshape(V, n, self.n_classes)                          # a = alpha * y
+        self.alphas_multiclass = (a * Y[None]).reshape(V * n, self.n_classes)  # alpha, stacked by view
 
-        block_gamma = np.array([])
-        for v in range(self.n_views):
-            diag_gamma = np.diag(np.array([self.gamma[v] + self.ro_adaptive * weights] * self.n_samples))
-            block_gamma = block_diag(block_gamma, diag_gamma)
-        block_gamma = block_gamma[1:, :]
-        self.block_gamma = block_gamma
+    def decision_function(self, X_test) -> np.ndarray:
+        K_test = self._test_kernels(X_test)
+        V, n = self.n_views, self.n_samples
+        a = self.alphas_multiclass.reshape(V, n, -1) * self.Y[None]
+        scores = sum(K_test[v] @ a[v] + self.biases_multiclass[v] for v in range(V))
+        self.y_pred_multiclass = scores / V
+        return self.y_pred_multiclass
 
-        I = np.zeros((self.n_samples * self.n_views, self.n_samples * self.n_views))
-        for v1 in range(self.n_views):
-            for v2 in range(self.n_views):
-                if v1 != v2:
-                    sl1 = slice(v1 * self.n_samples, (v1 + 1) * self.n_samples)
-                    sl2 = slice(v2 * self.n_samples, (v2 + 1) * self.n_samples)
-                    I[sl1, sl2] = np.eye(self.n_samples)
-
-        if self.n_classes == 2:
-            self.biases_multiclass, self.alphas_multiclass = self._solve_subproblem(Y, block_gamma, I)
-        else:
-            biases_multiclass = np.empty((self.n_views, 1))
-            alphas_multiclass = np.empty((self.n_samples * self.n_views, 1))
-            for i in range(self.n_classes):
-                b_i, a_i = self._solve_subproblem(Y[:, i], block_gamma, I)
-                biases_multiclass = np.hstack((biases_multiclass, b_i))
-                alphas_multiclass = np.hstack((alphas_multiclass, a_i))
-            self.biases_multiclass = biases_multiclass[:, 1:]
-            self.alphas_multiclass = alphas_multiclass[:, 1:]
-
-    def _solve_subproblem(self, y_binary, block_gamma, I):
-        block_Y = block_diag(*[y_binary.reshape(-1, 1) for _ in range(self.n_views)])
-        omegas = [y_binary.reshape(-1, 1) * y_binary.reshape(-1, 1).T * self.K[v] for v in range(self.n_views)]
-        block_omega = block_diag(*omegas)
-
-        p_bottom_left = (block_gamma @ block_Y) + (self.ro * I @ block_Y)
-        p_bottom_right = (block_gamma @ block_omega) + np.eye(self.n_samples * self.n_views) + (self.ro * I @ block_omega)
-        p = np.block([[np.zeros((self.n_views, self.n_views)), block_Y.T], [p_bottom_left, p_bottom_right]])
-        p += 1e-4 * np.eye(p.shape[0])
-
-        q_bottom = (block_gamma @ np.ones((self.n_samples * self.n_views, 1))) + \
-                   ((self.n_views - 1) * self.ro * np.ones((self.n_samples * self.n_views, 1)))
-        q = np.vstack([np.zeros((self.n_views, 1)), q_bottom])
-
-        solution = solve(p, q)
-        return solution[:self.n_views], solution[self.n_views:]
-
-    def predict(self, X_test):
-        K_test = [rbf_kernel_matrix(X_test[v], self.X_train[v], self.gamma_rbf) for v in range(self.n_views)]
-        self.K_test = K_test
-        n_samples_test = X_test[0].shape[0]
-        self.n_samples_test = n_samples_test
-        block_K_test = block_diag(*K_test)
-        self.block_K_test = block_K_test
-
-        if self.n_classes == 2:
-            return self._predict_binary(self.Y, self.alphas_multiclass, self.biases_multiclass, n_samples_test)
-
-        y_pred_multiclass = np.empty((n_samples_test, 1))
-        for cls in range(self.n_classes):
-            if self.n_views > 1:
-                alphas_cls = self.alphas_multiclass[:, cls]
-                biases_cls = self.biases_multiclass[:, cls]
-            else:
-                alphas_cls = self.alphas_multiclass[:, cls]
-                biases_cls = self.biases_multiclass.flatten()[cls]
-            y_pred = self._aggregate_views(self.Y[:, cls], alphas_cls, biases_cls, n_samples_test)
-            y_pred_multiclass = np.hstack((y_pred_multiclass, y_pred.reshape(-1, 1)))
-
-        self.y_pred_multiclass = y_pred_multiclass[:, 1:]
-        return np.argmax(self.y_pred_multiclass, axis=1)
-
-    def _predict_binary(self, y_binary, alphas, biases, n_samples_test):
-        if self.n_views > 1:
-            block_alphas = block_diag(*[alphas[i * self.n_samples:(i + 1) * self.n_samples].reshape(-1, 1) for i in range(self.n_views)])
-            block_biases = block_diag(*[np.array([biases[i]] * n_samples_test).reshape(-1, 1) for i in range(self.n_views)])
-        else:
-            block_alphas = alphas.reshape(-1, 1)
-            block_biases = np.array([biases.flatten()] * n_samples_test).reshape(-1, 1)
-
-        block_Y = block_diag(*[y_binary.reshape(-1, 1) for _ in range(self.n_views)])
-        y_pred_block = self.block_K_test @ (block_alphas * block_Y) + block_biases
-
-        y_pred = np.zeros((n_samples_test, self.n_views))
-        j = 0
-        for i in range(self.n_views):
-            y_pred[:, i] = y_pred_block[j:j + n_samples_test, i]
-            j += n_samples_test
-
-        self.y_pred_multiclass = np.mean(y_pred, axis=1)
-        return np.sign(self.y_pred_multiclass)
-
-    def _aggregate_views(self, y_binary, alphas_cls, biases_cls, n_samples_test):
-        if self.n_views > 1:
-            block_alphas = block_diag(*[alphas_cls[i * self.n_samples:(i + 1) * self.n_samples].reshape(-1, 1) for i in range(self.n_views)])
-            block_biases = block_diag(*[np.array([biases_cls[i]] * n_samples_test).reshape(-1, 1) for i in range(self.n_views)])
-        else:
-            block_alphas = alphas_cls.reshape(-1, 1)
-            block_biases = np.array([biases_cls] * n_samples_test).reshape(-1, 1)
-
-        block_Y = block_diag(*[y_binary.reshape(-1, 1) for _ in range(self.n_views)])
-        y_pred_block = self.block_K_test @ (block_alphas * block_Y) + block_biases
-
-        y_pred = np.zeros((n_samples_test, self.n_views))
-        j = 0
-        for i in range(self.n_views):
-            y_pred[:, i] = y_pred_block[j:j + n_samples_test, i]
-            j += n_samples_test
-        return np.mean(y_pred, axis=1)
+    def predict(self, X_test) -> np.ndarray:
+        return np.argmax(self.decision_function(X_test), axis=1)
 
 
 class PrecomputedMultiViewLSSVM(MultiViewLSSVM):
-    """Multi-view LS-SVM with pairwise error coupling, from precomputed per-view kernels."""
+    """Multi-view LS-SVM with pairwise error coupling, from precomputed
+    per-view kernels (train-vs-train for ``fit``, test-vs-train for
+    ``predict``)."""
 
     def __init__(self, gamma, ro: float = 10, ro_adaptive: float = 1):
         self.gamma = gamma
@@ -370,70 +315,14 @@ class PrecomputedMultiViewLSSVM(MultiViewLSSVM):
     def get_params(self, deep: bool = True) -> dict:
         return {"gamma": self.gamma, "ro": self.ro}
 
-    def fit(self, K, y, weights=0) -> None:
-        self.K = K
-        self.classes = np.unique(y)
-        self.n_classes = int(len(self.classes))
-        self.n_samples = int(K[0].shape[0])
-        self.n_views = len(self.K)
-        # `X_train` is unused for prediction here since kernels are precomputed,
-        # but kept for API symmetry with MultiViewLSSVM.
+    def fit(self, K, y, weights=0) -> "PrecomputedMultiViewLSSVM":
         self.X_train = None
+        self.K = [np.asarray(Kv, dtype=float) for Kv in K]
+        self._solve(y, weights)
+        return self
 
-        if self.n_classes > 2:
-            Y = np.zeros((self.n_samples, self.n_classes))
-            for i, cls in enumerate(self.classes):
-                Y[:, i] = np.where(y == cls, 1, -1)
-            self.Y = Y
-        else:
-            Y = y
-            self.Y = y
-
-        block_gamma = np.array([])
-        for v in range(self.n_views):
-            diag_gamma = np.diag(np.array([self.gamma[v] + self.ro_adaptive * weights] * self.n_samples))
-            block_gamma = block_diag(block_gamma, diag_gamma)
-        block_gamma = block_gamma[1:, :]
-        self.block_gamma = block_gamma
-
-        I = np.zeros((self.n_samples * self.n_views, self.n_samples * self.n_views))
-        for v1 in range(self.n_views):
-            for v2 in range(self.n_views):
-                if v1 != v2:
-                    sl1 = slice(v1 * self.n_samples, (v1 + 1) * self.n_samples)
-                    sl2 = slice(v2 * self.n_samples, (v2 + 1) * self.n_samples)
-                    I[sl1, sl2] = np.eye(self.n_samples)
-
-        if self.n_classes == 2:
-            self.biases_multiclass, self.alphas_multiclass = self._solve_subproblem(Y, block_gamma, I)
-        else:
-            biases_multiclass = np.empty((self.n_views, 1))
-            alphas_multiclass = np.empty((self.n_samples * self.n_views, 1))
-            for i in range(self.n_classes):
-                b_i, a_i = self._solve_subproblem(Y[:, i], block_gamma, I)
-                biases_multiclass = np.hstack((biases_multiclass, b_i))
-                alphas_multiclass = np.hstack((alphas_multiclass, a_i))
-            self.biases_multiclass = biases_multiclass[:, 1:]
-            self.alphas_multiclass = alphas_multiclass[:, 1:]
-
-    def predict(self, K_test):
-        self.K_test = K_test
-        n_samples_test = K_test[0].shape[0]
-        self.n_samples_test = n_samples_test
-        self.block_K_test = block_diag(*K_test)
-
-        if self.n_classes == 2:
-            return self._predict_binary(self.Y, self.alphas_multiclass, self.biases_multiclass, n_samples_test)
-
-        y_pred_multiclass = np.empty((n_samples_test, 1))
-        for cls in range(self.n_classes):
-            alphas_cls = self.alphas_multiclass[:, cls]
-            biases_cls = self.biases_multiclass[:, cls] if self.n_views > 1 else self.biases_multiclass.flatten()[cls]
-            y_pred = self._aggregate_views(self.Y[:, cls], alphas_cls, biases_cls, n_samples_test)
-            y_pred_multiclass = np.hstack((y_pred_multiclass, y_pred.reshape(-1, 1)))
-
-        self.y_pred_multiclass = y_pred_multiclass[:, 1:]
-        return np.argmax(self.y_pred_multiclass, axis=1)
+    def _test_kernels(self, K_test):
+        return [np.asarray(Kv, dtype=float) for Kv in K_test]
 
 
 # --------------------------------------------------------------------------- #
