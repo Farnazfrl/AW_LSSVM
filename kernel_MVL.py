@@ -98,6 +98,55 @@ class LSSVM:
         return np.sign(self.y_pred)
 
 
+def _solve_ovr_lssvm(K: np.ndarray, Y: np.ndarray, D: np.ndarray):
+    """Solve the one-vs-all LS-SVM duals (Eq. 4 of the paper) for all classes.
+
+    Substituting a = alpha * y and multiplying each row of Eq. (4) by y_k
+    (y_k^2 = 1) gives the equivalent label-free system
+
+        [0  1^T      ] [b]   [0]
+        [1  K + Lambda] [a] = [y],
+
+    so the labels only appear on the right-hand side. Subproblems that share
+    Lambda (``D`` of shape (n,)) are solved with one factorization and one
+    right-hand side per class; subproblem-specific Lambda (``D`` of shape
+    (n, C)) needs one factorization per class. The 1e-9 diagonal jitter is the
+    same as in the original formulation (it transforms identically).
+
+    Returns the biases (C,) and the dual variables alpha = a * y, shape (C, n).
+    """
+    n, n_classes = Y.shape
+    A = np.zeros((n + 1, n + 1))
+    A[0, 1:] = 1.0
+    A[1:, 0] = 1.0
+    A[1:, 1:] = K
+    A[np.diag_indices(n + 1)] += 1e-9
+    rhs = np.vstack([np.zeros((1, n_classes)), Y])
+    diag = np.arange(1, n + 1)
+
+    if D.ndim == 1:                       # shared Lambda: one factorization
+        A[diag, diag] += D
+        Z = np.linalg.solve(A, rhs)
+    else:                                 # class-specific Lambda
+        Z = np.empty((n + 1, n_classes))
+        for c in range(n_classes):
+            A_c = A.copy()
+            A_c[diag, diag] += D[:, c]
+            Z[:, c] = np.linalg.solve(A_c, rhs[:, c])
+    return Z[0], (Z[1:] * Y).T
+
+
+def _lambda_diagonal(gamma: float, ro: float, weights, n_samples: int) -> np.ndarray:
+    """Diagonal of Lambda = diag(1 / (gamma + ro * s_k)) for every class:
+    shape (n,) when it is the same for all classes, else (n, C)."""
+    if np.ndim(weights) == 0:
+        return np.full(n_samples, 1.0 / gamma)
+    weights = np.asarray(weights, dtype=float)
+    if np.all(weights == weights[:, :1]):
+        return 1.0 / (gamma + ro * weights[:, 0])
+    return 1.0 / (gamma + ro * weights)
+
+
 class MultiClassLSSVM:
     """One-vs-all multiclass LS-SVM from raw features (RBF kernel)."""
 
@@ -106,57 +155,31 @@ class MultiClassLSSVM:
         self.gamma_rbf = gamma_rbf
         self.ro = ro
 
-    def fit(self, X: np.ndarray, y: np.ndarray, weights: np.ndarray | int = 0) -> "MultiClassLSSVM":
+    def fit(self, X: np.ndarray, y: np.ndarray, weights: np.ndarray | int = 0,
+            K: np.ndarray | None = None) -> "MultiClassLSSVM":
+        """``weights``: per-sample, per-class weights s (n, C) or 0. ``K``: the
+        training kernel matrix, if already computed (e.g. reused across
+        AW-LSSVM iterations)."""
         self.X_train = X
         self.classes_ = np.unique(y)
-        n_samples = X.shape[0]
-        n_classes = len(self.classes_)
-        self.n_samples = n_samples
-        self.n_classes = n_classes
+        self.n_samples = X.shape[0]
+        self.n_classes = len(self.classes_)
 
-        K = rbf_kernel_matrix(X, X, self.gamma_rbf)
-
-        self.alphas_, self.biases_, self.y_binaries_ = [], [], []
-
-        for idx, cls in enumerate(self.classes_):
-            y_binary = np.where(y == cls, 1.0, -1.0)
-            self.y_binaries_.append(y_binary)
-
-            if isinstance(weights, int):
-                D = np.eye(n_samples) / self.gamma
-            else:
-                D = np.diag(1.0 / (self.gamma + self.ro * weights[:, idx]))
-
-            Y_outer = y_binary.reshape(-1, 1) @ y_binary.reshape(1, -1)
-            Omega = Y_outer * K
-            K_reg = Omega + D
-
-            A = np.zeros((n_samples + 1, n_samples + 1))
-            A[0, 1:] = y_binary
-            A[1:, 0] = y_binary
-            A[1:, 1:] = K_reg
-            A += 1e-9 * np.eye(A.shape[0])
-
-            b = np.zeros(n_samples + 1)
-            b[1:] = 1.0
-
-            solution = np.linalg.solve(A, b)
-            self.biases_.append(solution[0])
-            self.alphas_.append(solution[1:])
-
-        self.biases_ = np.array(self.biases_)
-        self.alphas_ = np.array(self.alphas_)
-        self.y_binaries_ = np.array(self.y_binaries_)
+        if K is None:
+            K = rbf_kernel_matrix(X, X, self.gamma_rbf)
+        Y = np.where(y[:, None] == self.classes_[None, :], 1.0, -1.0)
+        D = _lambda_diagonal(self.gamma, self.ro, weights, self.n_samples)
+        self.biases_, self.alphas_ = _solve_ovr_lssvm(K, Y, D)
+        self.y_binaries_ = Y.T
         return self
 
+    def predict_kernel(self, K_test: np.ndarray) -> np.ndarray:
+        """Predict from a precomputed test-vs-train kernel matrix."""
+        self.y_pred = K_test @ (self.alphas_ * self.y_binaries_).T + self.biases_
+        return np.argmax(self.y_pred, axis=1)
+
     def predict(self, X_test: np.ndarray) -> np.ndarray:
-        K_test = rbf_kernel_matrix(X_test, self.X_train, self.gamma_rbf)
-        n_samples_test = X_test.shape[0]
-        y_pred = np.zeros((n_samples_test, self.n_classes))
-        for i in range(self.n_classes):
-            y_pred[:, i] = (K_test @ (self.alphas_[i] * self.y_binaries_[i])) + self.biases_[i]
-        self.y_pred = y_pred
-        return np.argmax(y_pred, axis=1)
+        return self.predict_kernel(rbf_kernel_matrix(X_test, self.X_train, self.gamma_rbf))
 
 
 class PrecomputedMultiClassLSSVM:
@@ -166,53 +189,27 @@ class PrecomputedMultiClassLSSVM:
         self.gamma = gamma
         self.ro = ro
 
-    def fit(self, K_train: np.ndarray, y: np.ndarray, weights: np.ndarray | int = 0) -> "PrecomputedMultiClassLSSVM":
+    def fit(self, K_train: np.ndarray, y: np.ndarray, weights: np.ndarray | int = 0,
+            K: np.ndarray | None = None) -> "PrecomputedMultiClassLSSVM":
+        """``K`` is accepted for API symmetry with ``MultiClassLSSVM``; the
+        training kernel is ``K_train`` itself."""
         self.K = K_train
         self.classes_ = np.unique(y)
-        n_samples = K_train.shape[0]
-        n_classes = len(self.classes_)
-        self.n_samples = n_samples
-        self.n_classes = n_classes
+        self.n_samples = K_train.shape[0]
+        self.n_classes = len(self.classes_)
 
-        self.alphas_, self.biases_, self.y_binaries_ = [], [], []
-
-        for idx, cls in enumerate(self.classes_):
-            y_binary = np.where(y == cls, 1.0, -1.0)
-            self.y_binaries_.append(y_binary)
-
-            if isinstance(weights, int):
-                D = np.eye(n_samples) / self.gamma
-            else:
-                D = np.diag(1.0 / (self.gamma + self.ro * weights[:, idx]))
-
-            Y_outer = y_binary.reshape(-1, 1) @ y_binary.reshape(1, -1)
-            K_reg = Y_outer * K_train + D
-
-            A = np.zeros((n_samples + 1, n_samples + 1))
-            A[0, 1:] = y_binary
-            A[1:, 0] = y_binary
-            A[1:, 1:] = K_reg
-            A += 1e-9 * np.eye(A.shape[0])
-
-            b = np.zeros(n_samples + 1)
-            b[1:] = 1.0
-
-            solution = np.linalg.solve(A, b)
-            self.biases_.append(solution[0])
-            self.alphas_.append(solution[1:])
-
-        self.biases_ = np.array(self.biases_)
-        self.alphas_ = np.array(self.alphas_)
-        self.y_binaries_ = np.array(self.y_binaries_)
+        Y = np.where(y[:, None] == self.classes_[None, :], 1.0, -1.0)
+        D = _lambda_diagonal(self.gamma, self.ro, weights, self.n_samples)
+        self.biases_, self.alphas_ = _solve_ovr_lssvm(np.asarray(K_train, dtype=float), Y, D)
+        self.y_binaries_ = Y.T
         return self
 
+    def predict_kernel(self, K_test: np.ndarray) -> np.ndarray:
+        self.y_pred = K_test @ (self.alphas_ * self.y_binaries_).T + self.biases_
+        return np.argmax(self.y_pred, axis=1)
+
     def predict(self, K_test: np.ndarray) -> np.ndarray:
-        n_samples_test = K_test.shape[0]
-        y_pred = np.zeros((n_samples_test, self.n_classes))
-        for i in range(self.n_classes):
-            y_pred[:, i] = (K_test @ (self.alphas_[i] * self.y_binaries_[i])) + self.biases_[i]
-        self.y_pred = y_pred
-        return np.argmax(y_pred, axis=1)
+        return self.predict_kernel(K_test)
 
 
 # --------------------------------------------------------------------------- #
@@ -639,6 +636,10 @@ class _AdaptiveWeightedLSSVMBase:
         """Return a fresh per-view LSSVM instance for client `view_idx`."""
         raise NotImplementedError
 
+    def _view_kernel(self, view_idx: int, X: np.ndarray) -> np.ndarray:
+        """Training kernel matrix of view `view_idx`."""
+        raise NotImplementedError
+
     # ---- algorithm building blocks -----------------------------------------
 
     @staticmethod
@@ -744,6 +745,9 @@ class _AdaptiveWeightedLSSVMBase:
         common_hard_over_time = []
         all_models = []
 
+        # The view kernels do not change across iterations: compute them once.
+        kernels = [self._view_kernel(c, data[c]) for c in range(n_clients)]
+
         for t in range(range_steps):
             errors = np.zeros((n_clients, n_samples, n_classes))
             errors_orig = np.zeros((n_clients, n_samples, n_classes))
@@ -753,10 +757,10 @@ class _AdaptiveWeightedLSSVMBase:
 
             for c in range(n_clients):
                 model = self._build_view_model(c)
-                model.fit(data[c], y_train, weights[c, :, :])
+                model.fit(data[c], y_train, weights[c, :, :], K=kernels[c])
                 models_per_client.append(model)
 
-                y_pred_labels[:, c] = model.predict(data[c])
+                y_pred_labels[:, c] = model.predict_kernel(kernels[c])
                 y_sum += model.y_pred
 
                 errors[c], errors_orig[c] = self._sample_errors(
@@ -840,6 +844,9 @@ class AW_LSSVM(_AdaptiveWeightedLSSVMBase):
     def _build_view_model(self, view_idx: int) -> MultiClassLSSVM:
         return MultiClassLSSVM(self.gamma[view_idx], self.gamma_rbf[view_idx], ro=self.ro[view_idx])
 
+    def _view_kernel(self, view_idx: int, X: np.ndarray) -> np.ndarray:
+        return rbf_kernel_matrix(X, X, self.gamma_rbf[view_idx])
+
     def fit(self, X_train, y_train, range_steps: int):
         return self._fit_impl(X_train, y_train, range_steps)
 
@@ -868,6 +875,9 @@ class PrecomputedAW_LSSVM(_AdaptiveWeightedLSSVMBase):
 
     def _build_view_model(self, view_idx: int) -> PrecomputedMultiClassLSSVM:
         return PrecomputedMultiClassLSSVM(self.gamma[view_idx], ro=self.ro[view_idx])
+
+    def _view_kernel(self, view_idx: int, X: np.ndarray) -> np.ndarray:
+        return X
 
     def fit(self, K_train, y_train, range_steps: int):
         return self._fit_impl(K_train, y_train, range_steps)
