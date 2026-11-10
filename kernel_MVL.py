@@ -494,7 +494,8 @@ class MidlateFusion:
 
 class MidlateFusion_precomputed:
     """Late-fusion baseline via majority voting over per-view predictions,
-    for precomputed per-view kernels."""
+    for precomputed per-view kernels: ``X_train`` holds train-vs-train and
+    ``X_test`` test-vs-train kernel matrices, one per view."""
 
     def __init__(self, gamma: float = 1):
         self.gamma = gamma
@@ -516,7 +517,7 @@ class MidlateFusion_precomputed:
         y_pred_test = np.zeros((n_samples_test, n_clients))
 
         for c in range(n_clients):
-            model = MultiClassLSSVM(self.gamma[c])
+            model = PrecomputedMultiClassLSSVM(self.gamma[c])
             model.fit(X_train[c], y_train)
             y_pred[:, c] = model.predict(X_train[c])
             y_pred_test[:, c] = model.predict(X_test[c])
