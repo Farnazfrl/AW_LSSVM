@@ -116,6 +116,9 @@ def load_dataset(dataset: str):
     X_or_K      : list of arrays (feature views, or kernel matrices)
     y           : label-encoded target array
     n_clients   : number of views / kernels
+
+    Features are returned unscaled: ``split_views`` standardizes them
+    with the statistics of the training rows of each split or fold.
     """
     data = scipy.io.loadmat(f"datasets/{dataset}.mat")
 
@@ -127,7 +130,6 @@ def load_dataset(dataset: str):
 
     n_views = data["X"].shape[0]
     X = [data["X"][i][0] for i in range(n_views)]
-    X = [StandardScaler().fit_transform(view) for view in X]
     y = LabelEncoder().fit_transform(data["y"].flatten())
     return False, X, y, n_views
 
@@ -138,6 +140,19 @@ def load_dataset(dataset: str):
 
 def subset_views(views: Sequence[np.ndarray], idx: np.ndarray) -> list[np.ndarray]:
     return [view[idx] for view in views]
+
+
+def split_views(views: Sequence[np.ndarray], idx_fit: np.ndarray,
+                idx_apply: np.ndarray) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Rows ``idx_fit`` and ``idx_apply`` of every view, standardized with the
+    mean and std of the ``idx_fit`` rows only, so that no statistics of the
+    held-out rows (test split or validation fold) leak into training."""
+    fit, apply = [], []
+    for view in views:
+        scaler = StandardScaler().fit(view[idx_fit])
+        fit.append(scaler.transform(view[idx_fit]))
+        apply.append(scaler.transform(view[idx_apply]))
+    return fit, apply
 
 
 def subset_kernels(kernels: Sequence[np.ndarray], idx_tr: np.ndarray, idx_te: np.ndarray):
@@ -170,7 +185,7 @@ def cv_score_vfl(ctor, params: dict, X_train, y_train, *, cv: int = CV_SPLITS,
     skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=inner_seed)
     scores = []
     for tr_idx, va_idx in skf.split(X_train[0], y_train):
-        X_tr, X_va = subset_views(X_train, tr_idx), subset_views(X_train, va_idx)
+        X_tr, X_va = split_views(X_train, tr_idx, va_idx)
         y_tr, y_va = y_train[tr_idx], y_train[va_idx]
         model = ctor(**params)
         model.fit(X_tr, y_tr, range_steps=steps)
@@ -336,11 +351,12 @@ def run_raw_experiment(X, y, *, n_clients: int, coupling: str, method: str,
             idx_tr, idx_te = train_test_split(
                 idx, test_size=TEST_SIZE, random_state=int(seed), stratify=y
             )
-            X_train, X_test = subset_views(X, idx_tr), subset_views(X, idx_te)
+            X_train, X_test = split_views(X, idx_tr, idx_te)
             y_train, y_test = y[idx_tr], y[idx_te]
 
             gamma, gamma_rbf, ro, decay, steps, cv_score = search_raw(
-                X_train, y_train, spec, metric_name, seed=int(seed),
+                subset_views(X, idx_tr), y_train,   # raw rows: every CV fold is standardized with its own training rows
+                spec, metric_name, seed=int(seed),
                 n_clients=n_clients, coupling=coupling, method=method,
                 cv=CV_SPLITS, maxiter=maxiter,
             )

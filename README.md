@@ -31,7 +31,7 @@ Place each dataset as a `.mat` file in a `datasets/` folder at the repository ro
 - **Raw multi-view features:** `X` holds one feature matrix per view, and `y` holds the labels.
 - **Precomputed kernels** (`Flower`): `K` holds one kernel matrix per view, and `y` holds the labels.
 
-Features are standardized per view, and labels are label-encoded, when loaded.
+Labels are label-encoded when loaded. Features are standardized per view with the mean and standard deviation of the training rows only, separately for every train/test split and every cross-validation fold, so no test statistics leak into training.
 
 ## Usage
 

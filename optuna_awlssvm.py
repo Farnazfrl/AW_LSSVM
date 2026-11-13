@@ -31,7 +31,7 @@ from da_awlssvm import (
     CV_SPLITS, DECAY_BOUNDS, GAMMA_BOUNDS, GAMMA_RBF_BOUNDS, METRIC, RO_BOUNDS,
     SEEDS, STEPS_BOUNDS, TEST_SIZE, COUPLING_CHOICES, METHOD_CHOICES,
     cv_score_kernel, cv_score_vfl, load_dataset, score_from_model,
-    subset_kernels, subset_views,
+    subset_kernels, split_views, subset_views,
 )
 from kernel_MVL import AW_LSSVM, PrecomputedAW_LSSVM
 
@@ -138,11 +138,13 @@ def run_experiment(data, y, *, precomputed: bool, n_views: int, coupling: str,
         y_train, y_test = y[idx_tr], y[idx_te]
         if precomputed:
             train, test = subset_kernels(data, idx_tr, idx_te)
+            cv_train = train
         else:
-            train, test = subset_views(data, idx_tr), subset_views(data, idx_te)
+            train, test = split_views(data, idx_tr, idx_te)
+            cv_train = subset_views(data, idx_tr)   # raw rows: every CV fold is standardized with its own training rows
 
         params, steps, study = search(
-            train, y_train, precomputed=precomputed, n_views=n_views,
+            cv_train, y_train, precomputed=precomputed, n_views=n_views,
             coupling=coupling, method=method, seed=int(seed),
             metric_name=metric_name, n_trials=n_trials, n_jobs=n_jobs,
         )
