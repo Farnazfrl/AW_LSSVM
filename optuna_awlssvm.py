@@ -12,7 +12,7 @@ dual annealing:
 
 Example
 -------
-    python3 optuna_awlssvm.py --dataset 3Sources --coupling hard --method dissim --n_trials 200 --results_folder results
+    python3 optuna_awlssvm.py --dataset 3Sources --coupling hard --method dissim --n_trials 1000 --results_folder results
 """
 
 from __future__ import annotations
@@ -60,8 +60,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", required=True, choices=DATASET_CHOICES)
     parser.add_argument("--coupling", required=True, choices=COUPLING_CHOICES)
     parser.add_argument("--method", required=True, choices=METHOD_CHOICES)
-    parser.add_argument("--n_trials", type=int, required=True,
-                        help="Number of Optuna trials per seed (e.g. 200).")
+    parser.add_argument("--n_trials", type=int, default=1000,
+                        help="Number of Optuna trials per seed (default: 1000).")
     parser.add_argument("--results_folder", required=True,
                         help="Directory the output CSVs will be written to.")
     parser.add_argument("--seeds", type=int, nargs="+", default=SEEDS,
